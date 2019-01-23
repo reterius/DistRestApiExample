@@ -1,2 +1,3 @@
 venv/
 _pycache_/
+CeleryApp/__pycache__/
