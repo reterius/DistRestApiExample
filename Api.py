@@ -6,28 +6,22 @@ from flask_jwt_extended import (
 )
 
 from CheckLoginWorker import UserCheck
-
 import time
+import datetime
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+import json
+from bson import json_util
+import pprint
+
+client = MongoClient()
+client = MongoClient('localhost', 27017)
+db = client.TaskManagementDb
 
 app = Flask(__name__, static_url_path="")
 app.config['JWT_SECRET_KEY'] = 'super-secret'  # Change this!
 
 jwt = JWTManager(app)
-
-tasks = [
-    {
-        'id': 1,
-        'title': u'Buy groceries',
-        'description': u'Milk, Cheese, Pizza, Fruit, Tylenol',
-        'done': False
-    },
-    {
-        'id': 2,
-        'title': u'Learn Python',
-        'description': u'Need to find a good Python tutorial on the web',
-        'done': False
-    }
-]
 
 
 @app.route('/todo/api/v1.0/CheckLoginApi', methods=['POST'])
@@ -46,7 +40,7 @@ def CheckLoginApi():
             # at this time, our task is not finished, so it will return False
             print('Task finished? ', result.ready())
             print('Task result: ', result.result)
-            if (result.result['IsLegalUser'] == True):
+            if (result.result['IsLegalUser'] == False):
                 abort(404)
 
             ret = {
@@ -70,9 +64,9 @@ def refresh():
 def make_public_task(task):
     new_task = {}
     for field in task:
-        if field == 'id':
-            new_task['id'] = task['id']
-            new_task['uri'] = url_for('get_task', task_id=task['id'], _external=True)
+        if field == '_id':
+            new_task['_id'] = task['_id']['$oid']
+            new_task['uri'] = url_for('get_task', task_id=task['_id']['$oid'], _external=True)
         else:
             new_task[field] = task[field]
     return new_task
@@ -81,7 +75,20 @@ def make_public_task(task):
 @app.route('/todo/api/v1.0/ListAllTasks', methods=['POST'])
 @jwt_required
 def get_tasks():
-    return jsonify({'tasks': list(map(make_public_task, tasks))})
+    TasksCollection = db.Tasks
+    TasksList = []
+    UserDetails = get_jwt_identity()
+    for TaskRow in TasksCollection.find({
+        "$and":
+            [
+                {
+                    "UserID": ObjectId(UserDetails['_id']['$oid'])
+                }
+            ]
+    }).sort([("_id", -1)]):
+        TasksList.append(json.loads(json_util.dumps(TaskRow)))
+
+    return jsonify({'tasks': list(map(make_public_task, TasksList))})
 
 
 @app.route('/todo/api/v1.0/CreateTask', methods=['POST'])
@@ -89,31 +96,51 @@ def get_tasks():
 def create_task():
     if not request.json or not 'title' in request.json:
         abort(400)
-    task = {
-        'id': tasks[-1]['id'] + 1,
+
+    UserDetails = get_jwt_identity()
+
+    pprint.pprint(UserDetails)
+    pprint.pprint(UserDetails['_id']['$oid'])
+
+    Task = {
         'title': request.json['title'],
         'description': request.json.get('description', ""),
-        'done': False
+        'done': False,
+        'date': datetime.datetime.utcnow(),
+        'UserID': ObjectId(UserDetails['_id']['$oid'])
     }
-    tasks.append(task)
-    return jsonify({'task': make_public_task(task)}), 201
+
+    TasksCollection = db.Tasks
+    TaskID = TasksCollection.insert_one(Task).inserted_id
+    TaskRow = TasksCollection.find_one({"_id": ObjectId(TaskID)})
+    Task = json.loads(json_util.dumps(TaskRow))
+
+    return jsonify({'task': make_public_task(Task)}), 201
 
 
-@app.route('/todo/api/v1.0/TaskDetail/<int:task_id>', methods=['POST'])
+@app.route('/todo/api/v1.0/TaskDetail/<task_id>', methods=['GET'])
 @jwt_required
 def get_task(task_id):
-    task = list(filter(lambda t: t['id'] == task_id, tasks))
-    if len(task) == 0:
+    UserDetails = get_jwt_identity()
+    TasksCollection = db.Tasks
+    TaskRow = TasksCollection.find_one({"_id": ObjectId(task_id), 'UserID': ObjectId(UserDetails['_id']['$oid'])})
+    Task = json.loads(json_util.dumps(TaskRow))
+
+    if (Task is None):
         abort(404)
-    return jsonify({'task': make_public_task(task[0])})
+    return jsonify({'task': make_public_task(Task)})
 
 
-@app.route('/todo/api/v1.0/UpdateTask/<int:task_id>', methods=['PUT'])
+@app.route('/todo/api/v1.0/UpdateTask', methods=['PUT'])
 @jwt_required
-def update_task(task_id):
-    task = list(filter(lambda t: t['id'] == task_id, tasks))
+def update_task():
+    UserDetails = get_jwt_identity()
 
-    if len(task) == 0:
+    TaskID = request.json['TaskID']
+    TasksCollection = db.Tasks
+    RowCount = TasksCollection.count_documents({'_id': ObjectId(TaskID)})
+
+    if RowCount == 0:
         abort(404)
     if not request.json:
         abort(400)
@@ -123,19 +150,41 @@ def update_task(task_id):
         abort(400)
     if 'done' in request.json and type(request.json['done']) is not bool:
         abort(400)
-    task[0]['title'] = request.json.get('title', task[0]['title'])
-    task[0]['description'] = request.json.get('description', task[0]['description'])
-    task[0]['done'] = request.json.get('done', task[0]['done'])
-    return jsonify({'task': make_public_task(task[0])})
+
+    TasksCollection.update_one({
+        '_id': ObjectId(TaskID),
+        'UserID': ObjectId(UserDetails['_id']['$oid'])
+    }, {
+        '$set': {
+            'title': request.json['title'],
+            'description': request.json['description'],
+            'done': request.json['done']
+        }
+    }, upsert=False)
+
+    TaskRow = TasksCollection.find_one({"_id": ObjectId(TaskID)})
+    Task = json.loads(json_util.dumps(TaskRow))
+
+    return jsonify({'task': make_public_task(Task)})
 
 
-@app.route('/todo/api/v1.0/DeleteTask/<int:task_id>', methods=['DELETE'])
+@app.route('/todo/api/v1.0/DeleteTask/<task_id>', methods=['DELETE'])
 @jwt_required
 def delete_task(task_id):
-    task = list(filter(lambda t: t['id'] == task_id, tasks))
-    if len(task) == 0:
+    UserDetails = get_jwt_identity()
+    TasksCollection = db.Tasks
+
+    RowCount = TasksCollection.count_documents({
+        '_id': ObjectId(task_id),
+        'UserID': ObjectId(UserDetails['_id']['$oid'])
+    })
+    if RowCount == 0:
         abort(404)
-    tasks.remove(task[0])
+    TasksCollection.delete_one({
+        '_id': ObjectId(task_id),
+        'UserID': ObjectId(UserDetails['_id']['$oid'])
+    })
+
     return jsonify({'result': True})
 
 
