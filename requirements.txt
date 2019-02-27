@@ -13,6 +13,7 @@ MarkupSafe==1.1.0
 PyJWT==1.7.1
 pymongo==3.7.2
 pytz==2018.9
+redis==3.0.1
 tornado==5.1.1
 vine==1.2.0
 Werkzeug==0.14.1
